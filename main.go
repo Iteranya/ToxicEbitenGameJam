@@ -3,8 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/Iteranya/ToxicEbitenGamejam/hikarin_runtime/engine"
-
+	runtime "github.com/Iteranya/ToxicEbitenGamejam2026/hikarin_runtime"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -14,7 +13,7 @@ import (
 var storyJSON []byte
 
 type Game struct {
-	vn *engine.VisualNovelRuntime
+	vn *runtime.VisualNovelRuntime
 }
 
 func (g *Game) Update() error {
