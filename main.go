@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/Iteranya/ToxicEbitenGamejam2026/hikarin_runtime/engine"
+	"github.com/Iteranya/ToxicEbitenGamejam/hikarin_runtime/engine"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
