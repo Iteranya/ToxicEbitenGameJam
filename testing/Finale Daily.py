@@ -1,0 +1,5 @@
+vn.say("Nyarla", "Mm, I see your problem, the big house doesn't appreciate you trying to kill it")
+vn.say("Rue", "Just get me my bike back manager, and I'll work free for 1 year")
+vn.say("Nyarla", "Nyaaa~ I can put this mansion to sleep, but you'll have to find your bike~")
+vn.say("Mia", "It was swallowed in the front yard, right?")
+vn.say("Nyarla", "Humu humu~")
