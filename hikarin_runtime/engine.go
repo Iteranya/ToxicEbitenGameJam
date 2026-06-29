@@ -3,9 +3,11 @@ package hikarin_runtime
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Choice represents a single option in a choice menu.
@@ -16,11 +18,25 @@ type Choice struct {
 
 // SpriteInfo holds the data for a displayed sprite.
 type SpriteInfo struct {
-	Sprite        string `json:"sprite"`
-	Location      string `json:"location"`
-	DynLocation   string `json:"dyn_location,omitempty"`
-	FinalLocation string `json:"finalLocation,omitempty"`
-	Position      string `json:"position"`
+	Sprite        string  `json:"sprite"`
+	Location      string  `json:"location"`
+	DynLocation   string  `json:"dyn_location,omitempty"`
+	FinalLocation string  `json:"finalLocation,omitempty"`
+	Position      string  `json:"position"`
+	Column        float64 `json:"column"`
+	Row           float64 `json:"row"`
+	WRatio        float64 `json:"wRatio"`
+	HRatio        float64 `json:"hRatio"`
+	WFrameRatio   float64 `json:"wFrameRatio"`
+	HFrameRatio   float64 `json:"hFrameRatio"`
+}
+
+// LogEntry represents a structured log event, mimicking the JS payload.
+type LogEntry struct {
+	Category  string        `json:"category"`
+	Message   string        `json:"message"`
+	Args      []interface{} `json:"args"`
+	Timestamp time.Time     `json:"timestamp"`
 }
 
 // VNState indicates what the engine is waiting for.
@@ -35,6 +51,8 @@ const (
 )
 
 // OnEventFunc is a callback for various engine events (matches JS hooks).
+// Event types: "say", "choice", "show_sprite", "remove_sprite", "background",
+// "music", "music_stop", "autosave", "finish", "log"
 type OnEventFunc func(eventType string, data interface{})
 
 // VisualNovelRuntime replicates the JavaScript engine.
@@ -69,7 +87,7 @@ func NewRuntime() *VisualNovelRuntime {
 	}
 }
 
-// LoadScript decodes a JSON byte slice (the FSM) and resets the runtime.
+// LoadScript decodes a JSON byte slice (the FSM) and restores states.
 func (r *VisualNovelRuntime) LoadScript(jsonData []byte, savedGlobals, savedVariables map[string]interface{}) error {
 	var script []map[string]interface{}
 	if err := json.Unmarshal(jsonData, &script); err != nil {
@@ -77,11 +95,13 @@ func (r *VisualNovelRuntime) LoadScript(jsonData []byte, savedGlobals, savedVari
 	}
 	r.script = script
 
-	// Restore globals/variables (optional)
+	// Restore globals
 	r.globals = make(map[string]interface{})
 	for k, v := range savedGlobals {
 		r.globals[k] = v
 	}
+
+	// Restore locals (variables) instead of wiping them entirely
 	r.variables = make(map[string]interface{})
 	for k, v := range savedVariables {
 		r.variables[k] = v
@@ -90,29 +110,39 @@ func (r *VisualNovelRuntime) LoadScript(jsonData []byte, savedGlobals, savedVari
 	r.currentIndex = 0
 	r.state = StateIdle
 	r.ActiveSprites = make(map[string]SpriteInfo)
+
+	r.log("FLOW", fmt.Sprintf("Script Loaded. Total Steps: %d", len(r.script)))
 	return nil
 }
 
-// Start begins execution from the given label. If label is empty, starts from
-// the first instruction of the script (or the last autosave if present).
+// Start begins execution. If startLabel is empty, it attempts to resume from _autosave or index 0.
 func (r *VisualNovelRuntime) Start(startLabel string) {
 	if len(r.script) == 0 {
 		return
 	}
 	r.state = StatePlaying
 
-	// Autosave resume
+	// 1. If no specific label is forced, check if we have an autosave variable
 	if startLabel == "" {
-		if autosave, ok := r.variables["_autosave"].(string); ok {
+		if autosave, ok := r.variables["_autosave"].(string); ok && autosave != "" {
+			r.log("FLOW", fmt.Sprintf("Found '_autosave' variable. Resuming at label: '%s'", autosave))
 			startLabel = autosave
 		}
 	}
+
+	// 2. Execute Jump or Start from 0
 	if startLabel != "" {
+		r.log("FLOW", fmt.Sprintf("Starting execution at label: %s", startLabel))
 		r.jump(startLabel)
 	} else {
 		r.currentIndex = 0
 		r.step()
 	}
+}
+
+// Stop safely sets the state back to idle
+func (r *VisualNovelRuntime) Stop() {
+	r.state = StateIdle
 }
 
 // Advance moves past a dialogue and continues execution.
@@ -126,21 +156,64 @@ func (r *VisualNovelRuntime) Advance() {
 }
 
 // SelectChoice jumps to the chosen label.
-func (r *VisualNovelRuntime) SelectChoice(label string) {
+func (r *VisualNovelRuntime) SelectChoice(labelToJumpTo string) {
 	if r.state != StateChoice {
 		return
 	}
-	r.jump(label)
+	r.log("FLOW", fmt.Sprintf("Player selected choice -> Jumping to '%s'", labelToJumpTo))
+	r.jump(labelToJumpTo)
 }
 
 // SetEnvironment updates a key in the environment map (e.g., "isNight").
 func (r *VisualNovelRuntime) SetEnvironment(key string, value interface{}) {
-	r.environment[key] = value
+	if _, exists := r.environment[key]; exists {
+		r.log("FLOW", fmt.Sprintf("Environment updated: %s set to %v", key, value))
+		r.environment[key] = value
+	} else {
+		r.log("WARN", fmt.Sprintf("Attempted to set unknown environment key: '%s'", key))
+	}
 }
 
 // ------------------------------------------------------------
-// Internal stepping logic
+// Public API for Variable CRUD (Matches JS)
 // ------------------------------------------------------------
+
+func (r *VisualNovelRuntime) SetVariable(key string, value interface{}) {
+	r.log("VAR", fmt.Sprintf("External set LOCAL variable: '%s' = %v", key, value))
+	r.variables[key] = value
+}
+
+func (r *VisualNovelRuntime) SetGlobal(key string, value interface{}) {
+	r.log("VAR", fmt.Sprintf("External set GLOBAL variable: '%s' = %v", key, value))
+	r.globals[key] = value
+}
+
+func (r *VisualNovelRuntime) GetVariable(key string) interface{} {
+	return r.variables[key]
+}
+
+func (r *VisualNovelRuntime) GetGlobal(key string) interface{} {
+	return r.globals[key]
+}
+
+func (r *VisualNovelRuntime) DeleteVariable(key string) {
+	if _, exists := r.variables[key]; exists {
+		r.log("VAR", fmt.Sprintf("External delete LOCAL variable: '%s'", key))
+		delete(r.variables, key)
+	}
+}
+
+func (r *VisualNovelRuntime) DeleteGlobal(key string) {
+	if _, exists := r.globals[key]; exists {
+		r.log("VAR", fmt.Sprintf("External delete GLOBAL variable: '%s'", key))
+		delete(r.globals, key)
+	}
+}
+
+// ------------------------------------------------------------
+// Internal Stepping Logic
+// ------------------------------------------------------------
+
 func (r *VisualNovelRuntime) step() {
 	if r.currentIndex >= len(r.script) {
 		r.finish()
@@ -150,42 +223,50 @@ func (r *VisualNovelRuntime) step() {
 	step := r.script[r.currentIndex]
 	stepType, _ := step["type"].(string)
 	id, _ := step["id"].(string)
-	r.log("STEP", fmt.Sprintf("[ID:%s] TYPE: %s", id, stepType))
 
 	proceed := func() {
 		r.currentIndex++
 		r.step()
 	}
 
+	r.log("STEP", fmt.Sprintf("[ID:%s] TYPE: %s", id, stepType))
+
 	switch stepType {
 	case "conditional", "conditional_global":
 		passed := r.checkCondition(step)
 		if passed {
+			r.log("COND", "Condition PASSED. Continuing flow.")
 			proceed()
 		} else {
 			if endID, ok := step["end"].(string); ok && endID != "" {
+				r.log("COND", fmt.Sprintf("Condition FAILED. Skipping to ID: %s", endID))
 				r.jumpToId(endID)
 			} else {
-				proceed() // no end, just continue
+				r.log("ERR", "Condition Failed but no 'end' ID provided!")
+				proceed()
 			}
 		}
-	case "label",
-		"start",
-		"meta",
-		"command":
+
+	case "label", "start", "meta", "command":
 		if stepType == "meta" {
 			r.processMeta(step)
 		}
 		proceed()
+
 	case "transition":
 		if label, ok := step["label"].(string); ok {
 			r.jump(label)
 		}
+
 	case "next":
 		if label, ok := step["label"].(string); ok {
-			r.variables["_autosave"] = label
+			r.variables["_autosave"] = label // Save it to vars
+			if r.OnEvent != nil {
+				r.OnEvent("autosave", label)
+			}
 		}
 		proceed()
+
 	case "dialogue":
 		r.state = StateWaiting
 		speaker := r.parseString(getString(step, "label"))
@@ -195,6 +276,7 @@ func (r *VisualNovelRuntime) step() {
 		if r.OnEvent != nil {
 			r.OnEvent("say", map[string]string{"speaker": speaker, "text": content})
 		}
+
 	case "choice":
 		r.state = StateChoice
 		choices := r.parseChoices(step)
@@ -202,15 +284,40 @@ func (r *VisualNovelRuntime) step() {
 		if r.OnEvent != nil {
 			r.OnEvent("choice", choices)
 		}
+
 	case "show_sprite":
-		finalLoc := r.resolveSpriteLocation(step)
+		finalLoc := ""
+
+		// 1. Try dynamic location first
+		dynLoc, _ := step["dyn_location"].(string)
+		if dynLoc != "" {
+			parsed := r.parseString(dynLoc)
+			// Ensure it actually resolved (doesn't contain `<tag>`)
+			if !strings.Contains(parsed, "<") && !strings.Contains(parsed, ">") {
+				finalLoc = parsed
+			} else {
+				r.log("WARN", fmt.Sprintf("Dynamic sprite '%s' failed to resolve vars. Falling back.", dynLoc))
+			}
+		}
+
+		// 2. Fallback to static location
+		if finalLoc == "" {
+			finalLoc = r.parseString(getString(step, "location"))
+		}
+
 		if finalLoc != "" {
 			sprite := SpriteInfo{
 				Sprite:        getString(step, "sprite"),
 				Location:      getString(step, "location"),
-				DynLocation:   getString(step, "dyn_location"),
+				DynLocation:   dynLoc,
 				FinalLocation: finalLoc,
 				Position:      getString(step, "position"),
+				Column:        getFloat(step, "column"),
+				Row:           getFloat(step, "row"),
+				WRatio:        getFloat(step, "wRatio"),
+				HRatio:        getFloat(step, "hRatio"),
+				WFrameRatio:   getFloat(step, "wFrameRatio"),
+				HFrameRatio:   getFloat(step, "hFrameRatio"),
 			}
 			r.ActiveSprites[sprite.Sprite] = sprite
 			if r.OnEvent != nil {
@@ -218,13 +325,15 @@ func (r *VisualNovelRuntime) step() {
 			}
 		}
 		proceed()
+
 	case "remove_sprite":
-		sprite, _ := step["sprite"].(string)
+		sprite := getString(step, "sprite")
 		delete(r.ActiveSprites, sprite)
 		if r.OnEvent != nil {
 			r.OnEvent("remove_sprite", sprite)
 		}
 		proceed()
+
 	case "modify_background":
 		bg := r.parseString(getString(step, "background"))
 		r.Background = bg
@@ -232,6 +341,7 @@ func (r *VisualNovelRuntime) step() {
 			r.OnEvent("background", bg)
 		}
 		proceed()
+
 	case "play_music":
 		music := r.parseString(getString(step, "music"))
 		r.Music = music
@@ -239,35 +349,44 @@ func (r *VisualNovelRuntime) step() {
 			r.OnEvent("music", music)
 		}
 		proceed()
+
 	case "stop_music":
 		r.Music = ""
 		if r.OnEvent != nil {
 			r.OnEvent("music_stop", nil)
 		}
 		proceed()
-	case "modify_variable":
-		r.modVar(r.variables, step, "Local")
-		proceed()
-	case "modify_global":
-		r.modVar(r.globals, step, "Global")
-		proceed()
-	case "finish_dialogue":
-		r.finish()
+
 	case "unlock_dialogues":
 		r.unlockDialogues(step)
 		proceed()
+
 	case "idle_chat":
 		r.idleChat()
-		// idleChat jumps or proceeds internally
+
 	case "random_dialogue":
 		r.randomDialogue(step)
+
+	case "modify_variable":
+		r.modVar(r.variables, step, "Local")
+		proceed()
+
+	case "modify_global":
+		r.modVar(r.globals, step, "Global")
+		proceed()
+
+	case "finish_dialogue":
+		r.finish()
+
 	default:
 		r.log("ERR", fmt.Sprintf("Unknown Instruction: %s", stepType))
 		proceed()
 	}
 }
 
-// Helper functions ---------------------------------------------------
+// ------------------------------------------------------------
+// Logic Helpers
+// ------------------------------------------------------------
 
 func (r *VisualNovelRuntime) finish() {
 	r.state = StateEnded
@@ -292,6 +411,7 @@ func (r *VisualNovelRuntime) jump(labelName string) {
 	for i, s := range r.script {
 		if stype, _ := s["type"].(string); stype == "label" {
 			if slabel, _ := s["label"].(string); slabel == labelName {
+				r.log("FLOW", fmt.Sprintf("Jump Successful. Moving Index %d -> %d", r.currentIndex, i))
 				r.currentIndex = i
 				r.state = StatePlaying
 				r.step()
@@ -304,12 +424,11 @@ func (r *VisualNovelRuntime) jump(labelName string) {
 
 func (r *VisualNovelRuntime) processMeta(step map[string]interface{}) {
 	action, _ := step["action"].(string)
-	switch action {
-	case "create_var":
+	if action == "create_var" {
 		if varname, ok := step["var"].(string); ok {
 			r.variables[varname] = step["init"]
 		}
-	case "create_global":
+	} else if action == "create_global" {
 		if varname, ok := step["var"].(string); ok {
 			if _, exists := r.globals[varname]; !exists {
 				r.globals[varname] = step["init"]
@@ -319,18 +438,17 @@ func (r *VisualNovelRuntime) processMeta(step map[string]interface{}) {
 }
 
 func (r *VisualNovelRuntime) modVar(scope map[string]interface{}, step map[string]interface{}, label string) {
-	key, _ := step["var"].(string)
+	key := getString(step, "var")
 	if key == "" {
 		return
 	}
 	if _, exists := scope[key]; !exists {
-		scope[key] = 0
+		scope[key] = 0.0
 	}
 
 	action, _ := step["action"].(string)
 	val := step["value"]
 
-	// Ensure numeric if modifying
 	current, _ := toFloat(scope[key])
 	modValue, _ := toFloat(val)
 
@@ -342,44 +460,64 @@ func (r *VisualNovelRuntime) modVar(scope map[string]interface{}, step map[strin
 	case "subtract_var":
 		scope[key] = current - modValue
 	}
-	r.log("VAR", fmt.Sprintf("[%s] %s = %v", label, key, scope[key]))
 }
 
 func (r *VisualNovelRuntime) checkCondition(step map[string]interface{}) bool {
-	varName, _ := step["var"].(string)
+	varName := getString(step, "var")
 	targetValue := step["value"]
-	condition, _ := step["condition"].(string)
+	condition := getString(step, "condition")
+	stepType := getString(step, "type")
 
 	var val interface{}
-	if _, ok := r.environment[varName]; ok {
-		val = r.environment[varName]
-	} else if stepType, _ := step["type"].(string); stepType == "conditional_global" {
-		val = r.globals[varName]
+	valFound := false
+
+	// Check Environment First
+	if envVal, exists := r.environment[varName]; exists {
+		r.log("COND", fmt.Sprintf("Checking Environment property: '%s'", varName))
+		val = envVal
+		valFound = true
+	} else if stepType == "conditional_global" {
+		r.log("COND", fmt.Sprintf("Checking Global variable: '%s'", varName))
+		if gVal, exists := r.globals[varName]; exists {
+			val = gVal
+			valFound = true
+		}
 	} else {
-		val = r.variables[varName]
+		r.log("COND", fmt.Sprintf("Checking Local variable: '%s'", varName))
+		if lVal, exists := r.variables[varName]; exists {
+			val = lVal
+			valFound = true
+		}
 	}
-	if val == nil {
+
+	if !valFound {
 		val = 0
 	}
 
-	valFloat, _ := toFloat(val)
-	targetFloat, _ := toFloat(targetValue)
+	result := false
+	valFloat, vOk := toFloat(val)
+	targetFloat, tOk := toFloat(targetValue)
 
-	switch condition {
-	case "equal":
-		return compare(val, targetValue) == 0
-	case "not_equal":
-		return compare(val, targetValue) != 0
-	case "greater_than":
-		return valFloat > targetFloat
-	case "less_than":
-		return valFloat < targetFloat
-	default:
-		return false
+	if condition == "equal" {
+		result = compare(val, targetValue) == 0
+	} else if condition == "not_equal" {
+		result = compare(val, targetValue) != 0
+	} else if vOk && tOk {
+		if condition == "greater_than" {
+			result = valFloat > targetFloat
+		} else if condition == "less_than" {
+			result = valFloat < targetFloat
+		}
 	}
+
+	r.log("COND", fmt.Sprintf("Check '%s' (%v) %s '%v'? Result: %v", varName, val, condition, targetValue, result))
+	return result
 }
 
 func (r *VisualNovelRuntime) parseString(str string) string {
+	if str == "" {
+		return ""
+	}
 	re := regexp.MustCompile(`<([^>]+)>`)
 	return re.ReplaceAllStringFunc(str, func(match string) string {
 		key := match[1 : len(match)-1]
@@ -389,7 +527,7 @@ func (r *VisualNovelRuntime) parseString(str string) string {
 		if val, ok := r.variables[key]; ok {
 			return fmt.Sprintf("%v", val)
 		}
-		return match
+		return match // Leave as `<key>` if unresolved
 	})
 }
 
@@ -404,28 +542,12 @@ func (r *VisualNovelRuntime) parseChoices(step map[string]interface{}) []Choice 
 		if !ok {
 			continue
 		}
-		label, _ := m["label"].(string)
-		display, _ := m["display"].(string)
 		out = append(out, Choice{
-			Label:   label,
-			Display: r.parseString(display),
+			Label:   getString(m, "label"),
+			Display: r.parseString(getString(m, "display")),
 		})
 	}
 	return out
-}
-
-func (r *VisualNovelRuntime) resolveSpriteLocation(step map[string]interface{}) string {
-	// Try dynamic location first
-	dynLoc, _ := step["dyn_location"].(string)
-	if dynLoc != "" {
-		parsed := r.parseString(dynLoc)
-		if !strings.Contains(parsed, "<") {
-			return parsed
-		}
-	}
-	// Fallback to static location
-	loc, _ := step["location"].(string)
-	return r.parseString(loc)
 }
 
 func (r *VisualNovelRuntime) unlockDialogues(step map[string]interface{}) {
@@ -437,6 +559,8 @@ func (r *VisualNovelRuntime) unlockDialogues(step map[string]interface{}) {
 	if !ok {
 		unlocked = make([]interface{}, 0)
 	}
+
+	var newlyAdded []string
 	for _, ev := range events {
 		label, ok := ev.(string)
 		if !ok {
@@ -451,46 +575,78 @@ func (r *VisualNovelRuntime) unlockDialogues(step map[string]interface{}) {
 		}
 		if !found {
 			unlocked = append(unlocked, label)
+			newlyAdded = append(newlyAdded, label)
 		}
 	}
-	r.variables["_unlocked_dialogues"] = unlocked
+
+	if len(newlyAdded) > 0 {
+		r.variables["_unlocked_dialogues"] = unlocked
+		r.log("VAR", fmt.Sprintf("Unlocked dialogues: %s", strings.Join(newlyAdded, ", ")))
+	}
 }
 
 func (r *VisualNovelRuntime) idleChat() {
 	available, ok := r.variables["_unlocked_dialogues"].([]interface{})
-	if !ok || len(available) == 0 {
-		// no chats, just proceed
-		r.currentIndex++
-		r.step()
-		return
+	if ok && len(available) > 0 {
+		idx := rand.Intn(len(available))
+		if label, ok := available[idx].(string); ok && label != "" {
+			r.log("FLOW", fmt.Sprintf("Performing idle chat. Randomly selected: '%s'", label))
+			r.jump(label)
+			return
+		}
 	}
-	idx := rand.Intn(len(available))
-	label, _ := available[idx].(string)
-	if label != "" {
-		r.jump(label)
-	}
+	r.log("WARN", "Idle chat triggered, but '_unlocked_dialogues' is empty or not found. Skipping.")
+	r.currentIndex++
+	r.step()
 }
 
 func (r *VisualNovelRuntime) randomDialogue(step map[string]interface{}) {
 	events, ok := step["events"].([]interface{})
-	if !ok || len(events) == 0 {
-		r.currentIndex++
-		r.step()
-		return
+	if ok && len(events) > 0 {
+		idx := rand.Intn(len(events))
+		if label, ok := events[idx].(string); ok && label != "" {
+			r.log("FLOW", fmt.Sprintf("Performing random dialogue. Randomly selected: '%s'", label))
+			r.jump(label)
+			return
+		}
 	}
-	idx := rand.Intn(len(events))
-	label, _ := events[idx].(string)
-	if label != "" {
-		r.jump(label)
-	}
+	r.log("WARN", "Random dialogue triggered, but 'events' array is empty or not found. Skipping.")
+	r.currentIndex++
+	r.step()
 }
 
 // ------------------------------------------------------------
-// Utility functions
+// Logger & Data Utilities
 // ------------------------------------------------------------
+
+func (r *VisualNovelRuntime) log(category, msg string, args ...interface{}) {
+	// Standard output fallback
+	log.Printf("[%s] %s %v\n", category, msg, args)
+
+	// Emit structured hook event matching JS behavior
+	if r.OnEvent != nil {
+		entry := LogEntry{
+			Category:  category,
+			Message:   msg,
+			Args:      args,
+			Timestamp: time.Now(),
+		}
+		r.OnEvent("log", entry)
+	}
+}
+
 func getString(m map[string]interface{}, key string) string {
-	s, _ := m[key].(string)
-	return s
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getFloat(m map[string]interface{}, key string) float64 {
+	if f, ok := toFloat(m[key]); ok {
+		return f
+	}
+	return 1.0 // Safe default to prevent division by zero in UI scaling
 }
 
 func toFloat(v interface{}) (float64, bool) {
@@ -510,32 +666,21 @@ func toFloat(v interface{}) (float64, bool) {
 }
 
 func compare(a, b interface{}) int {
-	// tries to compare as float, then as string
 	f1, ok1 := toFloat(a)
 	f2, ok2 := toFloat(b)
 	if ok1 && ok2 {
-		switch {
-		case f1 < f2:
+		if f1 < f2 {
 			return -1
-		case f1 > f2:
-			return 1
-		default:
-			return 0
 		}
+		if f1 > f2 {
+			return 1
+		}
+		return 0
 	}
-	s1 := fmt.Sprintf("%v", a)
-	s2 := fmt.Sprintf("%v", b)
-	return strings.Compare(s1, s2)
+	return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
 }
 
-func (r *VisualNovelRuntime) log(category, msg string) {
-	// For debug; can be replaced with a callback
-	if r.OnEvent != nil {
-		r.OnEvent("log", map[string]string{"category": category, "message": msg})
-	}
-}
-
-// Getters for state (optional)
+// Getters for state
 func (r *VisualNovelRuntime) GetState() VNState     { return r.state }
 func (r *VisualNovelRuntime) GetBackground() string { return r.Background }
 func (r *VisualNovelRuntime) GetMusic() string      { return r.Music }
