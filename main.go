@@ -2,14 +2,13 @@ package main
 
 import (
 	"bytes"
-	_ "embed"
+	"embed" // Changed from _ "embed" so we can use embed.FS
 	"fmt"
 	"image"
 	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -26,6 +25,9 @@ import (
 //go:embed story.json
 var storyJSON []byte
 
+//go:embed assets
+var embeddedAssets embed.FS // This grabs your entire assets folder!
+
 // --- ASSET MANAGEMENT ---
 var (
 	AssetsPath = "assets/" // Path prefix for all dynamic assets
@@ -36,6 +38,7 @@ var (
 var (
 	dialogueFace *text.GoTextFace
 	nameFace     *text.GoTextFace
+	titleFace    *text.GoTextFace // Added a large font for the title
 )
 
 // --- THEME COLORS ---
@@ -49,6 +52,14 @@ var (
 	colorChoiceHov = color.RGBA{60, 85, 130, 255}
 )
 
+// --- GAME STATES ---
+type GameState int
+
+const (
+	StateTitleScreen GameState = iota
+	StatePlaying
+)
+
 func init() {
 	// Initialize Modern Fonts
 	regSource, _ := text.NewGoTextFaceSource(bytes.NewReader(goregular.TTF))
@@ -56,16 +67,45 @@ func init() {
 
 	dialogueFace = &text.GoTextFace{Source: regSource, Size: 24}
 	nameFace = &text.GoTextFace{Source: boldSource, Size: 26}
+	titleFace = &text.GoTextFace{Source: boldSource, Size: 64} // Big Title Font!
 }
 
 type Game struct {
-	vn *runtime.VisualNovelRuntime
+	vn    *runtime.VisualNovelRuntime
+	state GameState // Tracks if we are in Menu or Game
 }
 
 func (g *Game) Update() error {
 	sw, sh := 1280.0, 720.0
 	blockW, blockH := sw/16.0, sh/9.0
 
+	// --- TITLE SCREEN LOGIC ---
+	if g.state == StateTitleScreen {
+		mx, my := ebiten.CursorPosition()
+		mouseX, mouseY := float64(mx), float64(my)
+
+		// Begin Button Bounds
+		btnW, btnH := blockW*4.0, blockH*1.5
+		btnX, btnY := (sw-btnW)/2.0, sh*0.75
+
+		// Click to begin
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+			if mouseX >= btnX && mouseX <= btnX+btnW && mouseY >= btnY && mouseY <= btnY+btnH {
+				g.vn.Start("")
+				g.state = StatePlaying
+			}
+		}
+
+		// Also allow hitting Enter or Space to begin quickly
+		if inpututil.IsKeyJustPressed(ebiten.KeySpace) || inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+			g.vn.Start("")
+			g.state = StatePlaying
+		}
+
+		return nil
+	}
+
+	// --- VISUAL NOVEL LOGIC ---
 	switch g.vn.GetState() {
 	case runtime.StateWaiting:
 		if inpututil.IsKeyJustPressed(ebiten.KeySpace) ||
@@ -102,10 +142,11 @@ func (g *Game) Update() error {
 
 	case runtime.StateEnded:
 		if inpututil.IsKeyJustPressed(ebiten.KeyR) {
+			// Restart game, back to title screen
 			vn := runtime.NewRuntime()
 			vn.LoadScript(storyJSON, nil, nil)
-			vn.Start("")
 			g.vn = vn
+			g.state = StateTitleScreen
 		}
 	}
 	return nil
@@ -114,30 +155,65 @@ func (g *Game) Update() error {
 func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Fill(color.RGBA{10, 10, 10, 255})
 
+	sw, sh := 1280.0, 720.0
+	blockW, blockH := sw/16.0, sh/9.0
+
+	// --- TITLE SCREEN DRAW ---
+	if g.state == StateTitleScreen {
+		// 1. Draw Title Background
+		titleBg := getImage(AssetsPath + "images/title.png")
+		if titleBg != nil {
+			// Mapping (1,1) with size (1,1) makes our helper fill the whole screen cleanly
+			drawGridImage(screen, titleBg, 1, 1, 1, 1, 1, 1)
+		}
+
+		// 2. Draw Title Text (in case the artwork doesn't have it baked in)
+		gameTitle := ""
+		tw, _ := text.Measure(gameTitle, titleFace, titleFace.Size)
+		// Draw drop shadow
+		drawText(screen, gameTitle, titleFace, (sw-tw)/2+4, sh*0.2+4, color.RGBA{0, 0, 0, 200})
+		// Draw main text
+		drawText(screen, gameTitle, titleFace, (sw-tw)/2, sh*0.2, colorPanelLine)
+
+		// 3. Draw "Begin" Button
+		btnW, btnH := blockW*4.0, blockH*1.5
+		btnX, btnY := (sw-btnW)/2.0, sh*0.75
+
+		mx, my := ebiten.CursorPosition()
+		bgCol := colorChoice
+		if float64(mx) >= btnX && float64(mx) <= btnX+btnW && float64(my) >= btnY && float64(my) <= btnY+btnH {
+			bgCol = colorChoiceHov
+		}
+
+		drawUIBox(screen, btnX, btnY, btnW, btnH, bgCol, colorPanelLine)
+
+		btnTxt := "BEGIN"
+		bw, bh := text.Measure(btnTxt, nameFace, nameFace.Size)
+		drawText(screen, btnTxt, nameFace, btnX+(btnW-bw)/2, btnY+(btnH-bh)/2, colorText)
+
+		return
+	}
+
+	// --- VISUAL NOVEL DRAW ---
+
 	// 1. DYNAMIC BACKGROUND
 	if g.vn.Background != "" {
 		bgImg := getImage(AssetsPath + g.vn.Background)
-		// 1x1 logical framework representing the whole screen
-		drawGridImage(screen, bgImg, 1, 1, 1, 1, 1, 1)
+		// Map the background to an 8x6 grid size inside the 16x9 framework.
+		drawGridImage(screen, bgImg, 4.5, 1, 16, 9, 9, 9)
 	}
 
 	// 2. DYNAMIC CHARACTER SPRITES
-	// This relies on the dynamic grid ratios provided by the JS payload equivalent
 	for _, sprite := range g.vn.ActiveSprites {
 		img := getImage(AssetsPath + sprite.FinalLocation)
 		drawGridImage(screen, img, sprite.Column, sprite.Row, sprite.WRatio, sprite.HRatio, sprite.WFrameRatio, sprite.HFrameRatio)
 	}
 
-	sw, sh := 1280.0, 720.0
-	blockW, blockH := sw/16.0, sh/9.0
-
 	switch g.vn.GetState() {
 	case runtime.StateWaiting:
-		// Dialogue Box shows during normal script lines
 		drawDialogueBox(screen, g.vn.DialogueSpeaker, g.vn.DialogueText)
 
 	case runtime.StateChoice:
-		// Dialogue box is HIDDEN during choices, rendering only the choice layout
 		mx, my := ebiten.CursorPosition()
 		totalChoices := len(g.vn.Choices)
 
@@ -157,14 +233,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		}
 
 	case runtime.StateEnded:
-		drawDialogueBox(screen, "SYSTEM", "End of Script.\n(Press R to restart)")
+		drawDialogueBox(screen, "SYSTEM", "End of Script.\n(Press R to return to Title)")
 	}
 }
 
 // --- HELPER FUNCTIONS ---
-
-// getImage replicates JS `_verifyImageLoad`. It caches images, handles file loading,
-// logs explicit error messages for misses, and returns a "MISSING" texture fallback.
 func getImage(path string) *ebiten.Image {
 	if path == "" {
 		return nil
@@ -173,10 +246,15 @@ func getImage(path string) *ebiten.Image {
 		return img
 	}
 
-	file, err := os.Open(path)
+	// Go's embed package STRICTLY requires forward slashes for paths.
+	// We replace Windows backslashes (\) with forward slashes (/) just in case.
+	safePath := strings.ReplaceAll(path, "\\", "/")
+
+	// OPEN USING EMBEDDED FILE SYSTEM INSTEAD OF os.Open!
+	file, err := embeddedAssets.Open(safePath)
 	if err != nil {
-		log.Printf("[HikarinVN Error] Failed to load image: \"%s\"\nContext: Check if the file exists in your assets folder and the path is correct.\nError: %v", path, err)
-		imageCache[path] = createMissingTexture(path) // ← pass path!
+		log.Printf("[HikarinVN Error] Failed to load embedded image: \"%s\"\nError: %v", safePath, err)
+		imageCache[path] = createMissingTexture(path)
 		return imageCache[path]
 	}
 	defer file.Close()
@@ -184,7 +262,7 @@ func getImage(path string) *ebiten.Image {
 	img, _, err := image.Decode(file)
 	if err != nil {
 		log.Printf("[HikarinVN Error] Failed to decode image: \"%s\"\nError: %v", path, err)
-		imageCache[path] = createMissingTexture(path) // ← pass path!
+		imageCache[path] = createMissingTexture(path)
 		return imageCache[path]
 	}
 
@@ -193,9 +271,6 @@ func getImage(path string) *ebiten.Image {
 	return eImg
 }
 
-// createMissingTexture mimics the visual CSS properties of `.hvn-missing-asset`
-// createMissingTexture mimics the visual CSS properties of `.hvn-missing-asset`
-// and shows the actual filename that failed to load
 func createMissingTexture(path string) *ebiten.Image {
 	img := ebiten.NewImage(256, 256)
 	img.Fill(color.RGBA{100, 0, 0, 50}) // Translucent red background
@@ -214,14 +289,12 @@ func createMissingTexture(path string) *ebiten.Image {
 	return img
 }
 
-// drawGridImage accurately maps mathematical percentages provided by the runtime to screen space coordinates
 func drawGridImage(screen, img *ebiten.Image, col, row, wRatio, hRatio, frameW, frameH float64) {
 	if img == nil {
 		return
 	}
 	sw, sh := 1280.0, 720.0
 
-	// Dynamic calculation mapping exactly to JS's CSS percentage calculation logic
 	targetW := (frameW / wRatio) * sw
 	targetH := (frameH / hRatio) * sh
 	posX := ((col - 1) / wRatio) * sw
@@ -258,15 +331,14 @@ func drawDialogueBox(screen *ebiten.Image, speakerName, dialogueText string) {
 	drawText(screen, wrappedText, dialogueFace, boxX+padX, boxY+padY, colorText)
 }
 
-// getChoiceBounds centers elements vertically regardless of amount (replicates JS align-items/justify-content config)
 func getChoiceBounds(index, total int, blockW, blockH float64) (x, y, w, h float64) {
 	frameW, frameH := 7.0, 0.9
 	spacing := 1.2
 
 	totalHeight := float64(total) * spacing
-	startRow := (9.0 - totalHeight) / 2.0 // Flexbox center logic emulation
+	startRow := (9.0 - totalHeight) / 2.0
 
-	col := 4.5 // Horizontally centered inside 16 units wide: (16 - 7)/2
+	col := 4.5
 	row := startRow + float64(index)*spacing
 
 	return blockW * col, blockH * row, blockW * frameW, blockH * frameH
@@ -325,9 +397,15 @@ func main() {
 	if err := vn.LoadScript(storyJSON, nil, nil); err != nil {
 		log.Fatal(err)
 	}
-	vn.Start("")
 
-	g := &Game{vn: vn}
+	// NOTE: We REMOVED vn.Start("") from here so it doesn't run the VN until you hit Begin!
+
+	// Create the Game and set state to TitleScreen
+	g := &Game{
+		vn:    vn,
+		state: StateTitleScreen,
+	}
+
 	if err := ebiten.RunGame(g); err != nil {
 		log.Fatal(err)
 	}
